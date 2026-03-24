@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-22 15:16:10
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-22 16:10:56
+ * @LastEditTime: 2026-03-24 21:40:56
  * @FilePath: /yuelaiengine-gateway/internal/core/server.go
  * @Description:
  *
@@ -36,7 +36,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) Start() error	{
-	s.logger.Info(context.Background(), "服务器启动中", "addr", s.httpServer.Addr)
+	s.logger.Info(context.Background(), "服务器运行中", "addr", s.httpServer.Addr)
 	return s.httpServer.ListenAndServe()
 }
 
@@ -54,7 +54,7 @@ func NewServer(addr string, handler http.Handler, logger logger.Logger) *Server 
 	}
 }
 
-func (s *Server) GracefulShutdown() error {
+func (s *Server) WaitShutdown() error {
 	quit := make(chan os.Signal, 1)
 	// 监听 Ctrl + C / kill
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

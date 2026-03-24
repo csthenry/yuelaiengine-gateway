@@ -13,11 +13,11 @@ package logger
 type Options struct {
 	Level            string          `yaml:"level"`             // 日志级别
 	Format           string          `yaml:"format"`            // 格式 json/console
-	OutputPaths      []string        `yaml:"output-paths"`      // 输出路径列表
-	ErrorPaths       []string        `yaml:"error-paths"`       // 错误日志输出路径列表
-	EnableCaller     bool            `yaml:"enable-caller"`     // 是否启用调用者信息
-	EnableStacktrace bool            `yaml:"enable-stacktrace"` // 是否启用堆栈跟踪
-	StacktraceLevel  string          `yaml:"stacktrace-level"`  // 堆栈跟踪级别
+	OutputPaths      []string        `yaml:"output_paths"`      // 输出路径列表
+	ErrorPaths       []string        `yaml:"error_paths"`       // 错误日志输出路径列表
+	EnableCaller     bool            `yaml:"enable_caller"`     // 是否启用调用者信息
+	EnableStacktrace bool            `yaml:"enable_stacktrace"` // 是否启用堆栈跟踪
+	StacktraceLevel  string          `yaml:"stacktrace_level"`  // 堆栈跟踪级别
 	Rotation         RotationOptions `yaml:"rotation"`          // 日志滚动配置
 }
 
