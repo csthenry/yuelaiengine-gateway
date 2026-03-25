@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-22 15:15:45
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-24 21:24:30
+ * @LastEditTime: 2026-03-25 19:46:42
  * @FilePath: /yuelaiengine-gateway/internal/core/gateway.go
  * @Description:
  *
@@ -17,6 +17,7 @@ import (
 	"sync"
 	"yuelaiengine/gateway/internal/config"
 	"yuelaiengine/gateway/internal/core/health"
+	"yuelaiengine/gateway/internal/core/loadbalancer"
 	"yuelaiengine/gateway/pkg/logger"
 )
 
@@ -28,13 +29,10 @@ type Gateway struct {
 	config *config.GatewayConfig
 	router *Router
 	healthChecker *health.HealthChecker
+	lbFactory         *loadbalancer.LoadBalancerFactory
 	// [TODO]
-	// proxy             *Proxy
-	// lbFactory         *loadbalancer.LoadBalancerFactory
 	// pluginManager     *plugin.Manager
-	// rateLimitSvc      svc_ratelimit.Service
-	// circuitBreakerSvc svc_circuitbreaker.Service
-	// cbHandler         *handler_cb.CircuitBreakerHandler
+	// proxy             *Proxy
 	logger logger.Logger
 
 	reloadCancel context.CancelFunc
@@ -47,13 +45,25 @@ func NewGateway(cfg *config.GatewayConfig, logger logger.Logger) (*Gateway, erro
 		return nil, errors.New("gateway config is nil")
 	}
 
-	// [TODO]
+	// 初始化负载均衡器和服务健康检查
+	lbFactory := loadbalancer.NewLoadBalancerFactory()
 	healthChecker := health.NewHealthChecker(cfg.HealthCheck.Timeout, cfg.HealthCheck.Interval, logger)
-	// healthChecker := health.NewHealthChecker(cfg.HealthCheck.Timeout, cfg.HealthCheck.Interval, log)
+	healthChecker.SetStatusChangeHook(func(serviceName, instanceURL string, isHealthy bool) {
+		if err := lbFactory.UpdateInstanceAlive(serviceName, instanceURL, isHealthy); err != nil {
+			logger.Error(context.Background(), "同步实例健康状态到负载均衡器失败",
+				"service", serviceName,
+				"instance", instanceURL,
+				"healthy", isHealthy,
+				"error", err.Error())
+		}
+	})
+
+	// [TODO]
 	// pluginManager := plugin.NewManager(log)
 	// proxy := NewProxy(lbFactory, healthChecker, nil, log)
 
 	gw := &Gateway{
+		lbFactory:     lbFactory,
 		healthChecker: healthChecker,
 		// pluginManager: pluginManager,
 		// proxy:         proxy,

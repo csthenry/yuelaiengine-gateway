@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-24 20:41:01
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-24 21:57:24
+ * @LastEditTime: 2026-03-25 20:26:39
  * @FilePath: /yuelaiengine-gateway/internal/core/gateway_runtime.go
  * @Description:
  *
@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 	"yuelaiengine/gateway/internal/config"
+	"yuelaiengine/gateway/internal/core/loadbalancer"
 )
 
 // snapshot 返回网关当前快照
@@ -197,22 +198,27 @@ func (g *Gateway) applyConfigLocked(newCfg *config.GatewayConfig) error {
 }
 
 func (g *Gateway) syncServicesLocked(oldCfg, newCfg *config.GatewayConfig) error {
-	// [TODO] lbFactory
 	for _, serviceCfg := range newCfg.Services {
+		instances := make([]*loadbalancer.ServiceInstance, 0, len(serviceCfg.Instances))
 		instanceURLs := make([]string, 0, len(serviceCfg.Instances))
 		for _, inst := range serviceCfg.Instances {
+			instances = append(instances, &loadbalancer.ServiceInstance{
+				URL:    inst.URL,
+				Weight: inst.Weight,
+				Alive:  true,
+			})
 			instanceURLs = append(instanceURLs, inst.URL)
 		}
 
 		g.healthChecker.RegisterService(serviceCfg.Name, instanceURLs, serviceCfg.HealthCheckPath)
-		// g.lbFactory.ReplaceServiceInstances(serviceCfg.Name, serviceCfg.LoadBalancer, instances)
+		g.lbFactory.ReplaceServiceInstances(serviceCfg.Name, serviceCfg.LoadBalancer, instances)
 	}
 
 	if oldCfg != nil {
 		for oldService := range oldCfg.Services {
 			if _, stillExists := newCfg.Services[oldService]; !stillExists {
 				g.healthChecker.RemoveService(oldService)
-				// g.lbFactory.RemoveService(oldService)
+				g.lbFactory.RemoveService(oldService)
 			}
 		}
 	}

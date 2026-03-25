@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-24 16:55:20
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-24 20:01:11
+ * @LastEditTime: 2026-03-25 19:39:08
  * @FilePath: /yuelaiengine-gateway/internal/core/health/checker.go
  * @Description:
  *
@@ -12,27 +12,29 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
-
 	"yuelaiengine/gateway/pkg/logger"
 )
 
 // HealthChecker 负责监控所有上游服务的健康状态
 type HealthChecker struct {
-	client *http.Client
-	services sync.Map
-	stopChan chan struct{}
+	client      *http.Client
+	services    sync.Map
+	stopChan    chan struct{}
 	checkTicker *time.Ticker
-	logger logger.Logger
+	hookMu      sync.RWMutex
+	statusHook  func(serviceName, instanceURL string, isHealthy bool)
+	logger      logger.Logger
 }
 
 // ServiceCheckInfo 存储单个服务的健康信息
 type ServiceCheckInfo struct {
-	Instances []string
-	HealthPath string
-	Status map[string]bool	// Instance URL -> isHealthy
+	Instances   []string
+	HealthPath  string
+	Status      map[string]bool // Instance URL -> isHealthy
 	statusMutex sync.RWMutex
 }
 
@@ -42,9 +44,9 @@ func NewHealthChecker(timeout time.Duration, interval time.Duration, logger logg
 		client: &http.Client{
 			Timeout: timeout,
 		},
-		stopChan: make(chan struct{}),
+		stopChan:    make(chan struct{}),
 		checkTicker: time.NewTicker(interval),
-		logger: logger,
+		logger:      logger,
 	}
 }
 
@@ -52,19 +54,19 @@ func NewHealthChecker(timeout time.Duration, interval time.Duration, logger logg
 func (hc *HealthChecker) RegisterService(name string, instances []string, healthPath string) {
 	statusMap := make(map[string]bool)
 	for _, url := range instances {
-		statusMap[url] = false	// 设置初始状态
+		statusMap[url] = false // 设置初始状态
 	}
 	serviceInfo := &ServiceCheckInfo{
-		Instances: instances,
+		Instances:  instances,
 		HealthPath: healthPath,
-		Status: statusMap,
+		Status:     statusMap,
 	}
 	hc.services.Store(name, serviceInfo)
 	hc.logger.Info(context.Background(),
-	"[HealthChecker] 服务已注册",
-	"service", name,
-	"instance count", len(instances),
-	"health path", healthPath)
+		"[HealthChecker] 服务已注册",
+		"service", name,
+		"instance count", len(instances),
+		"health path", healthPath)
 }
 
 // RemoveService 从检查器中移除服务
@@ -72,8 +74,8 @@ func (hc *HealthChecker) RemoveService(name string) {
 	hc.services.Delete(name)
 
 	hc.logger.Info(context.Background(),
-	"[HealthChecker] 服务已移除",
-	"service", name)
+		"[HealthChecker] 服务已移除",
+		"service", name)
 }
 
 // ListServices 返回已经注册的服务列表
@@ -94,12 +96,12 @@ func (hc *HealthChecker) Start() {
 	hc.logger.Info(context.Background(), "[HealthChecker] 开启健康检查...")
 	for {
 		select {
-			case <-hc.checkTicker.C:
-				hc.runAllHealthChecks()
-			case <-hc.stopChan:
-				hc.checkTicker.Stop()
-				hc.logger.Info(context.Background(), "[HealthChecker] 健康检查已停止")
-				return
+		case <-hc.checkTicker.C:
+			hc.runAllHealthChecks()
+		case <-hc.stopChan:
+			hc.checkTicker.Stop()
+			hc.logger.Info(context.Background(), "[HealthChecker] 健康检查已停止")
+			return
 		}
 	}
 }
@@ -143,24 +145,39 @@ func (hc *HealthChecker) checkService(ctx context.Context, name string, info *Se
 	}
 }
 
+// SetStatusChangeHook 设置实例健康状态变更回调
+func (h *HealthChecker) SetStatusChangeHook(hook func(serviceName, instanceURL string, isHealthy bool)) {
+	h.hookMu.Lock()
+	defer h.hookMu.Unlock()
+	h.statusHook = hook
+}
+
 // updateServiceStatus 更新服务状态
 func (hc *HealthChecker) updateServiceStatus(ctx context.Context, name string, info *ServiceCheckInfo, url string, isHealthy bool) {
 	info.statusMutex.Lock()
-	defer info.statusMutex.Unlock()
-
 	wasHealthy, exists := info.Status[url]
-	if !exists || wasHealthy != isHealthy {
-		info.Status[url] = isHealthy
-		statusInfo := "healthy"
-		if !isHealthy {
-			statusInfo = "unhealthy"
-		}
-		hc.logger.Info(ctx,
-		"[HealthChecker] 服务状态更新",
-		"service", name,
-		"instance", url,
-		"status", statusInfo)
-		info.Status[url] = isHealthy
+	if exists && wasHealthy == isHealthy {
+		info.statusMutex.Unlock()
+		return
+	}
+	info.Status[url] = isHealthy
+	info.statusMutex.Unlock()
+
+	statusStr := "healthy"
+	if !isHealthy {
+		statusStr = "unhealthy"
+	}
+	hc.logger.Info(ctx, fmt.Sprintf("[HealthChecker] 状态变更 -> 服务: %s, 实例: %s, 当前状态: %s",
+		name, url, statusStr))
+	hc.notifyStatusChange(name, url, isHealthy)
+}
+
+func (h *HealthChecker) notifyStatusChange(serviceName, instanceURL string, isHealthy bool) {
+	h.hookMu.RLock()
+	hook := h.statusHook
+	h.hookMu.RUnlock()
+	if hook != nil {
+		hook(serviceName, instanceURL, isHealthy)
 	}
 }
 
