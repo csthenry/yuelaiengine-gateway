@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-30 21:05:45
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-30 21:14:13
+ * @LastEditTime: 2026-03-31 19:47:10
  * @FilePath: /yuelaiengine-gateway/internal/plugin/circuitbreaker/plugin.go
  * @Description:
  *
@@ -12,6 +12,7 @@ package circuitbreaker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -24,16 +25,16 @@ const PluginName = "circuitbreaker"
 
 type Plugin struct {
 	circuitBreakerSvc pl_circuitbreaker.Service
-	logger               logger.Logger
+	logger            logger.Logger
 }
 
 func NewPlugin(svc pl_circuitbreaker.Service, log logger.Logger) *Plugin {
 	if svc == nil {
-		log.Fatal(context.Background(), fmt.Sprintf("[插件 %s] 致命错误: circuitbreaker.Service 依赖注入失败，为 nil", PluginName))
+		log.Fatal(context.Background(), fmt.Sprintf("[插件 %s] circuitbreaker.Service 依赖注入失败", PluginName))
 	}
 	return &Plugin{
 		circuitBreakerSvc: svc,
-		logger:               log,
+		logger:            log,
 	}
 }
 
@@ -54,7 +55,7 @@ func (p *Plugin) Execute(w http.ResponseWriter, r *http.Request, pluginCfg confi
 
 	// 检查熔断状态
 	allowed, err := p.circuitBreakerSvc.CheckCircuit(ctx, serviceName)
-	if err != nil {
+	if err != nil && !errors.Is(err, pl_circuitbreaker.ErrOpenState) {
 		p.logger.Error(ctx, "[插件] 调用熔断服务失败", "plugin", p.Name(), "service", serviceName, "error", err)
 		http.Error(w, "熔断服务内部错误", http.StatusInternalServerError)
 		return false, fmt.Errorf("[插件 %s] 调用熔断服务失败: %w", p.Name(), err)
@@ -77,4 +78,3 @@ func (p *Plugin) parseConfig(cfg config.PluginSpec) (string, error) {
 	}
 	return service, nil
 }
-

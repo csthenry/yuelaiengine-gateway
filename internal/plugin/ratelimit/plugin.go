@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-30 21:06:01
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-30 21:34:17
+ * @LastEditTime: 2026-03-31 21:38:29
  * @FilePath: /yuelaiengine-gateway/internal/plugin/ratelimit/plugin.go
  * @Description:
  *
@@ -34,7 +34,7 @@ type Plugin struct {
 // NewPlugin 创建一个新的限流插件实例
 func NewPlugin(svc svc_ratelimit.Service, log logger.Logger) *Plugin {
 	if svc == nil {
-		log.Fatal(context.Background(), fmt.Sprintf("[插件 %s] 致命错误: ratelimit.Service 依赖注入失败，为 nil", PluginName))
+		log.Fatal(context.Background(), fmt.Sprintf("[插件 %s] ratelimit.Service 依赖注入失败", PluginName))
 	}
 	return &Plugin{
 		rateLimitSvc: svc,
@@ -51,14 +51,14 @@ func (p *Plugin) Name() string {
 func (p *Plugin) Execute(w http.ResponseWriter, r *http.Request, pluginCfg config.PluginSpec) (bool, error) {
 	ctx := r.Context()
 
-	// 1. 解析插件配置
+	// 解析插件配置
 	ruleName, strategy, err := p.parseConfig(pluginCfg)
 	if err != nil {
 		http.Error(w, "限流插件配置错误", http.StatusInternalServerError)
 		return false, fmt.Errorf("[插件 %s] %w", p.Name(), err)
 	}
 
-	// 2. 根据策略提取标识符
+	// 根据策略提取标识符
 	identifierFunc, err := limiter.GetIdentifierFunc(strategy)
 	if err != nil {
 		http.Error(w, "限流插件配置错误", http.StatusInternalServerError)
@@ -71,11 +71,11 @@ func (p *Plugin) Execute(w http.ResponseWriter, r *http.Request, pluginCfg confi
 			p.Name(), strategy,
 			"plugin", p.Name(),
 			"strategy", strategy)
-		// 如果无法识别，可以选择放行或拒绝，这里选择放行并记录日志
+		// 无法识别，这里选择放行并记录日志
 		return true, nil
 	}
 
-	// 3. 使用新的 Service 接口进行限流检查
+	// 使用 Service 接口进行限流检查
 	allowed, err := p.rateLimitSvc.CheckLimit(ctx, ruleName, identifier)
 	if err != nil {
 		http.Error(w, "限流服务内部错误", http.StatusInternalServerError)
@@ -83,8 +83,8 @@ func (p *Plugin) Execute(w http.ResponseWriter, r *http.Request, pluginCfg confi
 	}
 
 	if !allowed {
-		p.logger.Info(ctx, "[插件 %s] 请求被拒绝: [规则: %s, 标识: %s]",
-			p.Name(), ruleName, identifier,
+		p.logger.Info(ctx, fmt.Sprintf("[插件 %s] 请求被拒绝: [规则: %s, 标识: %s]",
+			p.Name(), ruleName, identifier),
 			"plugin", p.Name(),
 			"rule", ruleName,
 			"identifier", identifier,

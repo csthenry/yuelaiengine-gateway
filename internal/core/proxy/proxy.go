@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-26 22:55:29
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-27 16:57:25
+ * @LastEditTime: 2026-03-31 22:20:19
  * @FilePath: /yuelaiengine-gateway/internal/core/proxy/proxy.go
  * @Description:
  *
@@ -12,15 +12,15 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
-	"time"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"crypto/tls"
 	"strings"
+	"time"
 
 	"golang.org/x/net/http2"
 	"yuelaiengine/gateway/internal/config"
@@ -29,7 +29,7 @@ import (
 )
 
 // ServerHTTP 反向代理服务器
-func (p *Proxy) ServerHTTP(w http.ResponseWriter, r *http.Request, route *config.RouteConfig, service *config.ServiceConfig) {
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, route *config.RouteConfig, service *config.ServiceConfig) {
 	ctx := r.Context()
 
 	if service == nil {
@@ -44,7 +44,14 @@ func (p *Proxy) ServerHTTP(w http.ResponseWriter, r *http.Request, route *config
 	instance, err := p.getHealthyInstance(ctx, lb, service.Name, route, r)
 	if err != nil {
 		p.logger.Error(ctx, "[Proxy] 服务无可用实例", "service", service.Name, "error", err)
-		http.Error(w, fmt.Sprintf("服务 '%s' 当前不可用", service.Name), http.StatusServiceUnavailable)
+		// 无可用实例同样视作一次服务失败，用于触发熔断策略
+		p.mutex.RLock()
+		cbSvc := p.circuitBreakerSvc
+		p.mutex.RUnlock()
+		if cbSvc != nil {
+			cbSvc.RecordResult(ctx, service.Name, false)
+		}
+		http.Error(w, fmt.Sprintf("服务 '%s' 当前不可用", service.Name), http.StatusBadGateway)
 		return
 	}
 	p.logger.Info(ctx, "[Proxy] 选择健康实例", "service", service.Name, "instance", instance.URL)
@@ -68,7 +75,7 @@ func (p *Proxy) ServerHTTP(w http.ResponseWriter, r *http.Request, route *config
 	}
 	// 创建 Transcoder，提供 HTTP JSON <--> gRPC 支持
 	convertMode, routeTranscoder, err := p.prepareTranscoder(route)
-		if err != nil {
+	if err != nil {
 		p.logger.Error(ctx, "[Proxy] 协议转换配置错误", "route", route.PathPrefix, "error", err)
 		http.Error(w, "协议转换配置错误", http.StatusInternalServerError)
 		return
@@ -157,8 +164,17 @@ func (p *Proxy) ServerHTTP(w http.ResponseWriter, r *http.Request, route *config
 	// 执行代理
 	proxy.ServeHTTP(wrapper, r)
 
-	// [TODO]
-	// circuitBreakerSvc
+	// 根据响应状态码更新熔断器状态
+	statusCode := wrapper.GetStatusCode()
+	success := statusCode >= 200 && statusCode < 400
+
+	p.mutex.RLock()
+	cbSvc := p.circuitBreakerSvc
+	p.mutex.RUnlock()
+	if cbSvc != nil {
+		p.logger.Info(ctx, "[Proxy] 服务请求完成", "service", service.Name, "status_code", statusCode, "success", success)
+		cbSvc.RecordResult(ctx, service.Name, success)
+	}
 }
 
 // getHealthyInstance 获取下一个健康实例
@@ -202,14 +218,14 @@ func (p *Proxy) getHealthyInstance(ctx context.Context, lb loadbalancer.LoadBala
 // grpcH2CTransport 配置一个支持明文传输的 HTTP/2 客户端传输层
 // HTTP/2 默认强制要求使用 TLS，但在受信任的内部微服务网络中，没有必要进行 TLS，就会使用 H2C(HTTP/2 Cleartext)
 func grpcH2CTransport() *http2.Transport {
-    return &http2.Transport{
-        AllowHTTP: true,
-        DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-            return (&net.Dialer{
-                Timeout:   5 * time.Second, // 建立连接超时
-                KeepAlive: 30 * time.Second,
-            }).DialContext(ctx, network, addr)
-        },
-        IdleConnTimeout: 90 * time.Second,
-    }
+	return &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			return (&net.Dialer{
+				Timeout:   5 * time.Second, // 建立连接超时
+				KeepAlive: 30 * time.Second,
+			}).DialContext(ctx, network, addr)
+		},
+		IdleConnTimeout: 90 * time.Second,
+	}
 }

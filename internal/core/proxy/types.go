@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-26 22:22:57
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-27 16:19:11
+ * @LastEditTime: 2026-03-31 20:00:56
  * @FilePath: /yuelaiengine-gateway/internal/core/proxy/types.go
  * @Description:
  *
@@ -17,6 +17,7 @@ import (
 	"yuelaiengine/gateway/internal/core/health"
 	"yuelaiengine/gateway/internal/core/loadbalancer"
 	"yuelaiengine/gateway/internal/core/transcoding"
+	"yuelaiengine/gateway/internal/service/circuitbreaker"
 	"yuelaiengine/gateway/pkg/logger"
 )
 
@@ -26,8 +27,7 @@ type Proxy struct {
 	lbFactory *loadbalancer.LoadBalancerFactory
 	healthChecker *health.HealthChecker
 	logger logger.Logger
-	// [TODO]
-	// circuitBreakerSvc circuitbreaker.Service
+	circuitBreakerSvc circuitbreaker.Service
 	descriptorLoader  *transcoding.DescriptorResolver
 }
 
@@ -44,17 +44,22 @@ type hashSelector interface {
 	GetInstanceByKey(serviceName, key string) (*loadbalancer.ServiceInstance, error)
 }
 
-func NewProxy(lbFactory *loadbalancer.LoadBalancerFactory, hc *health.HealthChecker, logger logger.Logger) *Proxy {
+func NewProxy(lbFactory *loadbalancer.LoadBalancerFactory, hc *health.HealthChecker, cbSvc circuitbreaker.Service, logger logger.Logger) *Proxy {
 	return &Proxy{
 		lbFactory: lbFactory,
 		healthChecker: hc,
+		circuitBreakerSvc: cbSvc,
+		descriptorLoader:  transcoding.NewDescriptorResolver(),
 		logger: logger,
-		// [TODO]
 	}
 }
 
-// [TODO]
-// UpdateCircuitBreakerService
+// UpdateCircuitBreakerService 动态更新熔断器服务依赖，用于配置热更新
+func (p *Proxy) UpdateCircuitBreakerService(svr circuitbreaker.Service) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	p.circuitBreakerSvc = svr
+}
 
 func (w *responseWriterWrapper) WriteHeader(statusCode int) {
 	w.statusCode = statusCode

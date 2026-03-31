@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-24 20:41:01
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-25 20:26:39
+ * @LastEditTime: 2026-03-31 21:13:22
  * @FilePath: /yuelaiengine-gateway/internal/core/gateway_runtime.go
  * @Description:
  *
@@ -19,6 +19,11 @@ import (
 	"time"
 	"yuelaiengine/gateway/internal/config"
 	"yuelaiengine/gateway/internal/core/loadbalancer"
+	handler_cb "yuelaiengine/gateway/internal/handler/circuitbreaker"
+	pl_circuitbreaker "yuelaiengine/gateway/internal/plugin/circuitbreaker"
+	pl_ratelimit "yuelaiengine/gateway/internal/plugin/ratelimit"
+	svc_circuitbreaker "yuelaiengine/gateway/internal/service/circuitbreaker"
+	svc_ratelimit "yuelaiengine/gateway/internal/service/ratelimit"
 )
 
 // snapshot 返回网关当前快照
@@ -42,10 +47,18 @@ func (g *Gateway) Shutdown() {
 	defer g.mu.Unlock()
 
 	// 关闭限流服务
-	// [tODO]
+	if g.rateLimitSvc != nil {
+		if err := g.rateLimitSvc.Close(); err != nil {
+			g.logger.Error(ctx, "关闭限流服务时出错", "error", err)
+		}
+	}
 
 	// 关闭熔断器服务
-	// [TODO]
+	if g.circuitBreakerSvc != nil {
+		if err := g.circuitBreakerSvc.Close(ctx); err != nil {
+			g.logger.Error(ctx, "关闭熔断器服务时出错", "error", err)
+		}
+	}
 
 	g.logger.Info(ctx, "网关已成功关闭。")
 }
@@ -145,30 +158,28 @@ func (g *Gateway) applyConfigLocked(newCfg *config.GatewayConfig) error {
 
 	oldCfg := g.config
 
-	// [TODO] 限流和熔断
-	// oldRateLimitSvc := g.rateLimitSvc
-	// oldCircuitSvc := g.circuitBreakerSvc
+	// 限流和熔断
+	oldRateLimitSvc := g.rateLimitSvc
+	oldCircuitSvc := g.circuitBreakerSvc
 
-	// newRateLimitSvc, err := svc_ratelimit.NewService(newCfg.RateLimiting, g.logger)
-	// if err != nil {
-	// 	return fmt.Errorf("初始化限流服务失败: %w", err)
-	// }
+	newRateLimitSvc, err := svc_ratelimit.NewService(newCfg.RateLimiting, g.logger)
+	if err != nil {
+		return fmt.Errorf("初始化限流服务失败: %w", err)
+	}
 
-	// newCircuitSvc := svc_circuitbreaker.NewService(
-	// 	newCfg.CircuitBreaker.FailureThreshold,
-	// 	newCfg.CircuitBreaker.SuccessThreshold,
-	// 	newCfg.CircuitBreaker.ResetTimeout,
-	// 	g.logger,
-	// )
+	newCircuitSvc := svc_circuitbreaker.NewService(
+		newCfg.CircuitBreaker.FailureThreshold,
+		newCfg.CircuitBreaker.SuccessThreshold,
+		newCfg.CircuitBreaker.ResetTimeout,
+		g.logger,
+	)
 
 	if err := g.syncServicesLocked(oldCfg, newCfg); err != nil {
-		// _ = newRateLimitSvc.Close()
+		_ = newRateLimitSvc.Close()
 		return err
 	}
 
-	// [TODO] 刷新插件依赖
-	// rateLimitPlugin := pl_ratelimit.NewPlugin(newRateLimitSvc, g.logger)
-	// g.pluginManager.Register(rateLimitPlugin)
+	// 刷新插件依赖 [TODO] Auth Plugin
 
 	// authPlugin, err := pl_auth.NewPlugin(g.lbFactory, g.healthChecker, "auth-service", newCfg.AuthService.ValidateURL, g.logger)
 	// if err != nil {
@@ -176,23 +187,26 @@ func (g *Gateway) applyConfigLocked(newCfg *config.GatewayConfig) error {
 	// 	return fmt.Errorf("初始化认证插件失败: %w", err)
 	// }
 	// g.pluginManager.Register(authPlugin)
-	// g.pluginManager.Register(pl_circuitbreaker.NewPlugin(newCircuitSvc, g.logger))
 	// g.pluginManager.Register(pl_apikey.NewPlugin(g.logger))
 	// g.pluginManager.Register(pl_rbac.NewPlugin(g.logger))
 
-	// g.rateLimitSvc = newRateLimitSvc
-	// g.circuitBreakerSvc = newCircuitSvc
-	// g.proxy.UpdateCircuitBreakerService(newCircuitSvc)
+	rateLimitPlugin := pl_ratelimit.NewPlugin(newRateLimitSvc, g.logger)
+	g.pluginManager.Register(rateLimitPlugin)
+	g.pluginManager.Register(pl_circuitbreaker.NewPlugin(newCircuitSvc, g.logger))
+
+	g.rateLimitSvc = newRateLimitSvc
+	g.circuitBreakerSvc = newCircuitSvc
+	g.proxy.UpdateCircuitBreakerService(newCircuitSvc)
 	g.config = newCfg
 	g.router = NewRouter(newCfg.Routes, g.logger)
-	// g.cbHandler = handler_cb.NewCircuitBreakerHandler(newCfg, newCircuitSvc, g.logger)
+	g.cbHandler = handler_cb.NewCircuitBreakerHandler(newCircuitSvc, g.logger)
 
-	// if oldRateLimitSvc != nil {
-	// 	_ = oldRateLimitSvc.Close()
-	// }
-	// if oldCircuitSvc != nil {
-	// 	_ = oldCircuitSvc.Close(context.Background())
-	// }
+	if oldRateLimitSvc != nil {
+		_ = oldRateLimitSvc.Close()
+	}
+	if oldCircuitSvc != nil {
+		_ = oldCircuitSvc.Close(context.Background())
+	}
 
 	return nil
 }
