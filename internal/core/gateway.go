@@ -16,8 +16,11 @@ import (
 	"hash/fnv"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"yuelaiengine/gateway/internal/config"
 	"yuelaiengine/gateway/internal/core/health"
 	"yuelaiengine/gateway/internal/core/loadbalancer"
@@ -25,6 +28,7 @@ import (
 	"yuelaiengine/gateway/internal/core/routingkey"
 	handler_cb "yuelaiengine/gateway/internal/handler/circuitbreaker"
 	"yuelaiengine/gateway/internal/plugin"
+	"yuelaiengine/gateway/internal/plugin/httperr"
 	svc_circuitbreaker "yuelaiengine/gateway/internal/service/circuitbreaker"
 	svc_ratelimit "yuelaiengine/gateway/internal/service/ratelimit"
 
@@ -36,19 +40,35 @@ import (
 type Gateway struct {
 	mu sync.RWMutex
 
-	config *config.GatewayConfig
-	router *Router
-	healthChecker *health.HealthChecker
+	config            *config.GatewayConfig
+	router            *Router
+	healthChecker     *health.HealthChecker
 	lbFactory         *loadbalancer.LoadBalancerFactory
 	pluginManager     *plugin.Manager
 	proxy             *proxy.Proxy
-	rateLimitSvc      svc_ratelimit.Service      			// 限流服务
-	circuitBreakerSvc svc_circuitbreaker.Service 			// 熔断器服务
+	rateLimitSvc      svc_ratelimit.Service      // 限流服务
+	circuitBreakerSvc svc_circuitbreaker.Service // 熔断器服务
 	cbHandler         *handler_cb.CircuitBreakerHandler
-	logger logger.Logger
+	logger            logger.Logger
 
-	reloadCancel context.CancelFunc
-	reloadPath string
+	reloadCancel  context.CancelFunc
+	monitorCancel context.CancelFunc
+	reloadPath    string
+	monitorPath   string
+
+	metrics *metricsCollector
+	webUI   *webAssetServer
+
+	versionCounter atomic.Uint64
+	configHistory  []configSnapshot
+	maxHistory     int
+}
+
+type configSnapshot struct {
+	Version   string
+	Source    string
+	CreatedAt time.Time
+	Config    *config.GatewayConfig
 }
 
 // NewGateway 创建网关实例，初始化组件
@@ -79,12 +99,15 @@ func NewGateway(cfg *config.GatewayConfig, logger logger.Logger) (*Gateway, erro
 		healthChecker: healthChecker,
 		pluginManager: pluginManager,
 		proxy:         proxy,
-		config: cfg,
-		logger: logger,
+		config:        cfg,
+		logger:        logger,
+		metrics:       newMetricsCollector(),
+		webUI:         newWebAssetServer("./web/dist"),
+		maxHistory:    20,
 	}
 
 	gw.mu.Lock()
-	if err := gw.applyConfigLocked(cfg.Clone()); err != nil {
+	if err := gw.applyConfigLocked(cfg.Clone(), "bootstrap"); err != nil {
 		gw.mu.Unlock()
 		return nil, err
 	}
@@ -99,13 +122,13 @@ func NewGateway(cfg *config.GatewayConfig, logger logger.Logger) (*Gateway, erro
 
 // ServeHTTP 网关请求处理入口，实现 http.Handler 接口
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	start := time.Now()
+	wrapper := &gatewayResponseWriter{ResponseWriter: w}
+	defer func() {
+		g.metrics.Observe(wrapper.StatusCode(), time.Since(start))
+	}()
 
-	// [TODO]
-	// if strings.HasPrefix(r.URL.Path, "/admin/") {
-	// 	g.handleAdminRequest(w, r)
-	// 	return
-	// }
+	ctx := r.Context()
 
 	cfg, router := g.snapshot()
 
@@ -114,22 +137,22 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if route == nil {
 		// 路径存在但方法不允许，返回 405
 		if matchedByPath := router.FindRouteByPathOnly(r.URL.Path); matchedByPath != nil {
-			g.logger.Info(ctx, "请求路径匹配但方法不允许",
+			g.logger.Debug(ctx, "请求路径匹配但方法不允许",
 				"method", r.Method,
 				"path", r.URL.Path,
 				"allowed_methods", matchedByPath.Methods)
-			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+			httperr.Write(wrapper, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "方法不允许")
 			return
 		}
 
-		g.logger.Info(ctx, "请求未匹配到任何路由", "method", r.Method, "path", r.URL.Path)
-		http.Error(w, "服务未找到", http.StatusNotFound)
+		g.logger.Debug(ctx, "请求未匹配到任何路由", "method", r.Method, "path", r.URL.Path)
+		httperr.Write(wrapper, http.StatusNotFound, "ROUTE_NOT_FOUND", "服务未找到")
 		return
 	}
 
 	// 健康检查路由特殊处理
 	if route.ServiceName == "all-services" {
-		g.HealthCheckHandler(w, r)
+		g.HealthCheckHandler(wrapper, r)
 		return
 	}
 
@@ -137,30 +160,31 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	targetServiceName := g.selectTargetService(cfg, route, r)
 	service, exist := cfg.Services[targetServiceName]
 	if !exist {
-		g.logger.Info(ctx, "请求匹配到路由但服务未在配置中定义", "method", r.Method, "path", r.URL.Path, "route", route.PathPrefix, "service", targetServiceName)
-		http.Error(w, "服务配置错误", http.StatusInternalServerError)
+		g.logger.Debug(ctx, "请求匹配到路由但服务未在配置中定义", "method", r.Method, "path", r.URL.Path, "route", route.PathPrefix, "service", targetServiceName)
+		httperr.Write(wrapper, http.StatusInternalServerError, "SERVICE_CONFIG_ERROR", "服务配置错误")
 		return
 	}
-	g.logger.Info(ctx, "请求匹配到路由", "method", r.Method, "path", r.URL.Path, "service", service.Name)
+	g.logger.Debug(ctx, "请求匹配到路由", "method", r.Method, "path", r.URL.Path, "service", service.Name)
 
-	// 插件
-	pluginSpecs := route.Plugins
-
-	// [TODO] Auth Plugin
+	// 插件链（支持 requires_auth 自动注入）
+	pluginSpecs := clonePluginSpecs(route.Plugins)
+	if route.RequiresAuth && !hasPlugin(pluginSpecs, "auth") {
+		pluginSpecs = append(pluginSpecs, config.PluginSpec{"name": "auth"})
+	}
 
 	// 执行插件链
-	continueChain, err := g.pluginManager.ExecuteChain(w, r, pluginSpecs)
+	continueChain, err := g.pluginManager.ExecuteChain(wrapper, r, pluginSpecs)
 	if err != nil {
 		g.logger.Error(ctx, "插件链执行因内部错误中断", "error", err)
 		return
 	}
 	if !continueChain {
-		g.logger.Info(ctx, "插件链中断请求，处理结束")
+		g.logger.Debug(ctx, "插件链中断请求，处理结束")
 		return
 	}
 
 	// 反向代理转发请求
-	g.proxy.ServeHTTP(w, r, route, &service)
+	g.proxy.ServeHTTP(wrapper, r, route, &service)
 }
 
 // selectTargetService：按 A/B -> 权重 -> 默认服务 逐级选择
@@ -253,4 +277,26 @@ func clonePluginSpecs(src []config.PluginSpec) []config.PluginSpec {
 	dst := make([]config.PluginSpec, len(src))
 	copy(dst, src)
 	return dst
+}
+
+type gatewayResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *gatewayResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *gatewayResponseWriter) StatusCode() int {
+	if w.statusCode == 0 {
+		return http.StatusOK
+	}
+	return w.statusCode
+}
+
+func (g *Gateway) nextVersionID() string {
+	n := g.versionCounter.Add(1)
+	return "v" + strconv.FormatUint(n, 10)
 }

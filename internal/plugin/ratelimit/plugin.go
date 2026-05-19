@@ -17,6 +17,7 @@ import (
 
 	"yuelaiengine/gateway/internal/config"
 	"yuelaiengine/gateway/internal/core/limiter"
+	"yuelaiengine/gateway/internal/plugin/httperr"
 	svc_ratelimit "yuelaiengine/gateway/internal/service/ratelimit"
 	"yuelaiengine/gateway/pkg/logger"
 )
@@ -54,14 +55,14 @@ func (p *Plugin) Execute(w http.ResponseWriter, r *http.Request, pluginCfg confi
 	// 解析插件配置
 	ruleName, strategy, err := p.parseConfig(pluginCfg)
 	if err != nil {
-		http.Error(w, "限流插件配置错误", http.StatusInternalServerError)
+		httperr.Write(w, http.StatusInternalServerError, "PLUGIN_CONFIG_INVALID", "限流插件配置错误")
 		return false, fmt.Errorf("[插件 %s] %w", p.Name(), err)
 	}
 
 	// 根据策略提取标识符
 	identifierFunc, err := limiter.GetIdentifierFunc(strategy)
 	if err != nil {
-		http.Error(w, "限流插件配置错误", http.StatusInternalServerError)
+		httperr.Write(w, http.StatusInternalServerError, "PLUGIN_CONFIG_INVALID", "限流插件配置错误")
 		return false, fmt.Errorf("[插件 %s] %w", p.Name(), err)
 	}
 
@@ -78,18 +79,18 @@ func (p *Plugin) Execute(w http.ResponseWriter, r *http.Request, pluginCfg confi
 	// 使用 Service 接口进行限流检查
 	allowed, err := p.rateLimitSvc.CheckLimit(ctx, ruleName, identifier)
 	if err != nil {
-		http.Error(w, "限流服务内部错误", http.StatusInternalServerError)
+		httperr.Write(w, http.StatusInternalServerError, "RATE_LIMIT_SERVICE_ERROR", "限流服务内部错误")
 		return false, fmt.Errorf("[插件 %s] 调用限流服务失败: %w", p.Name(), err)
 	}
 
 	if !allowed {
-		p.logger.Info(ctx, fmt.Sprintf("[插件 %s] 请求被拒绝: [规则: %s, 标识: %s]",
+		p.logger.Debug(ctx, fmt.Sprintf("[插件 %s] 请求被拒绝: [规则: %s, 标识: %s]",
 			p.Name(), ruleName, identifier),
 			"plugin", p.Name(),
 			"rule", ruleName,
 			"identifier", identifier,
 			"action", "rejected")
-		http.Error(w, "请求过于频繁", http.StatusTooManyRequests)
+		httperr.Write(w, http.StatusTooManyRequests, "RATE_LIMIT_EXCEEDED", "请求过于频繁")
 		return false, nil // 中断插件链
 	}
 

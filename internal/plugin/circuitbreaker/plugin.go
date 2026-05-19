@@ -17,6 +17,7 @@ import (
 	"net/http"
 
 	"yuelaiengine/gateway/internal/config"
+	"yuelaiengine/gateway/internal/plugin/httperr"
 	pl_circuitbreaker "yuelaiengine/gateway/internal/service/circuitbreaker"
 	"yuelaiengine/gateway/pkg/logger"
 )
@@ -49,7 +50,7 @@ func (p *Plugin) Execute(w http.ResponseWriter, r *http.Request, pluginCfg confi
 	serviceName, err := p.parseConfig(pluginCfg)
 	if err != nil {
 		p.logger.Error(ctx, "[插件] 熔断插件配置错误", "plugin", p.Name(), "error", err)
-		http.Error(w, "熔断插件配置错误", http.StatusInternalServerError)
+		httperr.Write(w, http.StatusInternalServerError, "PLUGIN_CONFIG_INVALID", "熔断插件配置错误")
 		return false, fmt.Errorf("[插件 %s] %w", p.Name(), err)
 	}
 
@@ -57,17 +58,17 @@ func (p *Plugin) Execute(w http.ResponseWriter, r *http.Request, pluginCfg confi
 	allowed, err := p.circuitBreakerSvc.CheckCircuit(ctx, serviceName)
 	if err != nil && !errors.Is(err, pl_circuitbreaker.ErrOpenState) {
 		p.logger.Error(ctx, "[插件] 调用熔断服务失败", "plugin", p.Name(), "service", serviceName, "error", err)
-		http.Error(w, "熔断服务内部错误", http.StatusInternalServerError)
+		httperr.Write(w, http.StatusInternalServerError, "CIRCUIT_BREAKER_SERVICE_ERROR", "熔断服务内部错误")
 		return false, fmt.Errorf("[插件 %s] 调用熔断服务失败: %w", p.Name(), err)
 	}
 
 	if !allowed {
 		p.logger.Warn(ctx, "[插件] 请求被熔断", "plugin", p.Name(), "service", serviceName)
-		http.Error(w, "服务暂时不可用", http.StatusServiceUnavailable)
+		httperr.Write(w, http.StatusServiceUnavailable, "CIRCUIT_OPEN", "服务暂时不可用")
 		return false, nil // 中断插件链
 	}
 
-	p.logger.Info(ctx, "[插件] 熔断检查通过", "plugin", p.Name(), "service", serviceName)
+	p.logger.Debug(ctx, "[插件] 熔断检查通过", "plugin", p.Name(), "service", serviceName)
 	return true, nil // 继续下一个插件
 }
 

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"yuelaiengine/gateway/pkg/logger"
@@ -66,6 +67,7 @@ type Service interface {
 	CheckCircuit(ctx context.Context, serviceName string) (bool, error) // 检查是否允许请求
 	RecordResult(ctx context.Context, serviceName string, success bool) // 记录后端服务请求结果
 	GetAllState(ctx context.Context) map[string]CircuitState            // 获取所有熔断器状态
+	OpenTransitionCount(ctx context.Context) uint64                     // 熔断器打开次数
 	Reset(ctx context.Context, serviceName string) error                // 重置对应服务的熔断器
 	Close(ctx context.Context) error                                    // 关闭熔断器服务
 }
@@ -86,7 +88,8 @@ type service struct {
 	FailureThreshold int                        // 全局失败阈值（默认5次）
 	SuccessThreshold int                        // 全局成功阈值（默认2次）
 	ResetTimeout     time.Duration              // 全局重置超时时间（默认1分钟）
-	logger           logger.Logger              // 日志记录器
+	openTransitions  atomic.Uint64
+	logger           logger.Logger // 日志记录器
 }
 
 // 验证 Service 接口实现
@@ -124,11 +127,25 @@ func NewService(failureThreshold int, successThreshold int, resetTimeout time.Du
 
 // GetAllState 返回所有熔断器状态
 func (s *service) GetAllState(ctx context.Context) map[string]CircuitState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	result := make(map[string]CircuitState, len(s.circuitBreakers))
 	for serviceName, cb := range s.circuitBreakers {
+		// 状态查询时也推进 open -> half-open，便于监控可观测到半开态。
+		if cb.state == StateOpen && time.Since(cb.lastOpenTime) >= s.ResetTimeout {
+			prevState := cb.state.GetState()
+			cb.state = StateHalfOpen
+			cb.failureCount = 0
+			cb.successCount = 0
+			s.logger.Info(ctx, "Circuit breaker state transition",
+				"service_name", serviceName,
+				"old_state", prevState,
+				"new_state", cb.state.GetState(),
+				"service", "circuitbreaker",
+				"action", "state_transition_observe")
+		}
+
 		result[serviceName] = CircuitState{
 			ServiceName:      serviceName,
 			State:            cb.state.GetState(),
@@ -149,22 +166,28 @@ func (s *service) GetAllState(ctx context.Context) map[string]CircuitState {
 	return result
 }
 
+// OpenTransitionCount 返回熔断器从非 open 切换到 open 的累计次数。
+func (s *service) OpenTransitionCount(ctx context.Context) uint64 {
+	return s.openTransitions.Load()
+}
+
 // Reset 重置对于服务的熔断器
 func (s *service) Reset(ctx context.Context, serviceName string) error {
-	s.mu.RLock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	cb, exists := s.circuitBreakers[serviceName]
-	s.mu.RUnlock()
-
 	if !exists {
-		s.logger.Error(ctx, "Service not found in circuit breaker",
+		cb = &CircuitBreaker{
+			state: StateClosed,
+		}
+		s.circuitBreakers[serviceName] = cb
+		s.logger.Info(ctx, "Initialized circuit breaker for service during reset",
 			"service_name", serviceName,
+			"initial_state", "closed",
 			"service", "circuitbreaker",
-			"action", "reset_failed")
-		return ErrServiceNotFound
+			"action", "reset_initialize")
 	}
-
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
 
 	cb.state = StateClosed
 	cb.failureCount = 0
@@ -201,7 +224,7 @@ func (s *service) CheckCircuit(ctx context.Context, serviceName string) (bool, e
 	switch cb.state {
 	case StateOpen:
 		// 大于重置时间则进入半开状态
-		if time.Since(cb.lastOpenTime) > s.ResetTimeout {
+		if time.Since(cb.lastOpenTime) >= s.ResetTimeout {
 			prevState := cb.state
 			cb.state = StateHalfOpen
 			cb.failureCount = 0
@@ -229,6 +252,8 @@ func (s *service) CheckCircuit(ctx context.Context, serviceName string) (bool, e
 			"service_name", serviceName,
 			"service", "circuitbreaker",
 			"action", "request_allowed")
+		return true, nil
+	case StateClosed:
 		return true, nil
 	default:
 		// 未知状态：默认允许请求
@@ -295,6 +320,7 @@ func (s *service) RecordResult(ctx context.Context, serviceName string, success 
 		if cb.state == StateClosed && cb.failureCount >= s.FailureThreshold {
 			prevState := cb.state.GetState()
 			cb.state = StateOpen
+			s.openTransitions.Add(1)
 			// 在熔断之前，需要记录熔断时间
 			cb.lastOpenTime = time.Now()
 			s.logger.Warn(ctx, "Circuit breaker state transition",
@@ -309,6 +335,7 @@ func (s *service) RecordResult(ctx context.Context, serviceName string, success 
 		if cb.state == StateHalfOpen {
 			prevState := cb.state.GetState()
 			cb.state = StateOpen
+			s.openTransitions.Add(1)
 			cb.lastOpenTime = time.Now()
 			s.logger.Warn(ctx, "Circuit breaker state transition",
 				"service_name", serviceName,

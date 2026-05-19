@@ -119,7 +119,7 @@ func (s *service) CheckLimit(ctx context.Context, ruleName, identifier string) (
 			"service", "ratelimit",
 			"action", "check_passed")
 	} else {
-		s.logger.Info(ctx, "Rate limit check failed - request blocked",
+		s.logger.Debug(ctx, "Rate limit check failed - request blocked",
 			"rule_name", ruleName,
 			"identifier", identifier,
 			"limiter_type", lim.Name(),

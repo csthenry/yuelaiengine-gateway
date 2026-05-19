@@ -163,12 +163,13 @@ func applyJSONToGRPCResponseTranscoding(resp *http.Response, transcoder *transco
 	}
 
 	if resp.StatusCode >= 400 {
+		originalStatus := resp.StatusCode
 		message := strings.TrimSpace(string(rawBody))
 		if message == "" {
-			message = http.StatusText(resp.StatusCode)
+			message = http.StatusText(originalStatus)
 		}
 		rewriteResponse(resp, http.StatusOK, "application/grpc", []byte{})
-		resp.Header.Set("Grpc-Status", strconv.Itoa(httpStatusToGRPCCode(resp.StatusCode)))
+		resp.Header.Set("Grpc-Status", strconv.Itoa(httpStatusToGRPCCode(originalStatus)))
 		resp.Header.Set("Grpc-Message", url.QueryEscape(message))
 		return nil
 	}

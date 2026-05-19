@@ -29,6 +29,7 @@ type Proxy struct {
 	logger logger.Logger
 	circuitBreakerSvc circuitbreaker.Service
 	descriptorLoader  *transcoding.DescriptorResolver
+	httpTransport     *http.Transport
 }
 
 type responseWriterWrapper struct {
@@ -50,6 +51,7 @@ func NewProxy(lbFactory *loadbalancer.LoadBalancerFactory, hc *health.HealthChec
 		healthChecker: hc,
 		circuitBreakerSvc: cbSvc,
 		descriptorLoader:  transcoding.NewDescriptorResolver(),
+		httpTransport:     newHTTPTransport(),
 		logger: logger,
 	}
 }

@@ -1,2 +1,8 @@
 /logs/
 /.vscode/
+/web/node_modules/
+/web/dist/
+.gocache
+config.yml
+api-gateway
+interview.md

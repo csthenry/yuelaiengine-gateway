@@ -28,14 +28,14 @@ var log logger.Logger
 func mainHandler(w http.ResponseWriter, r *http.Request) {
 	port := getPort()
 	ctx := context.Background()
-	log.Info(ctx, "Service A received request", "port", port, "path", r.URL.Path)
+	log.Debug(ctx, "Service A received request", "port", port, "path", r.URL.Path)
 	fmt.Fprintf(w, "Hello from Service A at port %s, path: %s\n", port, r.URL.Path)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	port := getPort()
 	ctx := context.Background()
-	log.Info(ctx, "Service A received health check request", "port", port)
+	log.Debug(ctx, "Service A received health check request", "port", port)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "OK")
 }

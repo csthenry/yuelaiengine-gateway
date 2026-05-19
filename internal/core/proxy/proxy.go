@@ -2,7 +2,7 @@
  * @Author: Henry csthenry@foxmail.com
  * @Date: 2026-03-26 22:55:29
  * @LastEditors: Henry csthenry@foxmail.com
- * @LastEditTime: 2026-03-31 22:20:19
+ * @LastEditTime: 2026-04-03 11:15:49
  * @FilePath: /yuelaiengine-gateway/internal/core/proxy/proxy.go
  * @Description:
  *
@@ -35,6 +35,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, route *config.
 	if service == nil {
 		p.logger.Error(ctx, "[Proxy] 服务配置错误", "route", route.PathPrefix)
 		http.Error(w, "网关内部错误", http.StatusInternalServerError)
+		return
 	}
 
 	// 获取负载均衡器
@@ -54,7 +55,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, route *config.
 		http.Error(w, fmt.Sprintf("服务 '%s' 当前不可用", service.Name), http.StatusBadGateway)
 		return
 	}
-	p.logger.Info(ctx, "[Proxy] 选择健康实例", "service", service.Name, "instance", instance.URL)
+	p.logger.Debug(ctx, "[Proxy] 选择健康实例", "service", service.Name, "instance", instance.URL)
 
 	// 如果负载均衡器采用 LC 算法，则需要进行连接释放
 	if releaser, ok := lb.(connectionReleaser); ok {
@@ -72,6 +73,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, route *config.
 	if strings.EqualFold(route.UpstreamProtocol, "grpc") {
 		// 使用 H2C Transport
 		proxy.Transport = grpcH2CTransport()
+	} else if p.httpTransport != nil {
+		// 对 HTTP 上游使用共享连接池，降低高并发下的建连抖动。
+		proxy.Transport = p.httpTransport
 	}
 	// 创建 Transcoder，提供 HTTP JSON <--> gRPC 支持
 	convertMode, routeTranscoder, err := p.prepareTranscoder(route)
@@ -115,7 +119,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, route *config.
 					newPath = "/"
 				}
 				req.URL.Path = newPath
-				p.logger.Info(req.Context(), "[Proxy] 路径重写", "original_path", originalPath, "new_path", newPath)
+				p.logger.Debug(req.Context(), "[Proxy] 路径重写", "original_path", originalPath, "new_path", newPath)
 			}
 		}
 
@@ -172,7 +176,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, route *config.
 	cbSvc := p.circuitBreakerSvc
 	p.mutex.RUnlock()
 	if cbSvc != nil {
-		p.logger.Info(ctx, "[Proxy] 服务请求完成", "service", service.Name, "status_code", statusCode, "success", success)
+		p.logger.Debug(ctx, "[Proxy] 服务请求完成", "service", service.Name, "status_code", statusCode, "success", success)
 		cbSvc.RecordResult(ctx, service.Name, success)
 	}
 }
@@ -227,5 +231,19 @@ func grpcH2CTransport() *http2.Transport {
 			}).DialContext(ctx, network, addr)
 		},
 		IdleConnTimeout: 90 * time.Second,
+	}
+}
+
+func newHTTPTransport() *http.Transport {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          2048,
+		MaxIdleConnsPerHost:   512,
+		MaxConnsPerHost:       0,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 }

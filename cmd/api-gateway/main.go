@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"time"
 
+	"yuelaiengine/gateway/internal/api"
 	"yuelaiengine/gateway/internal/config"
 	"yuelaiengine/gateway/internal/core"
 	"yuelaiengine/gateway/pkg/logger"
@@ -42,6 +43,7 @@ func main() {
 	if err != nil {
 		logger.Fatal(ctx, "创建网关失败", "error", err)
 	}
+	gw.SetConfigPath("./config/config.yml")
 	logger.Info(ctx, "网关层初始化成功。")
 
 	// 配置热更新
@@ -55,7 +57,8 @@ func main() {
 	}
 
 	// 创建并启动 HTTP 服务器
-	srv := core.NewServer(cfg.Server.Port, gw, logger)
+	router := api.NewRouter(gw, logger)
+	srv := core.NewServer(cfg.Server.Port, router, logger)
 	logger.Info(ctx, "HTTP 服务器创建完成", "port", cfg.Server.Port)
 
 	// 在一个 Goroutine 中启动服务器，以便主 Goroutine 可以监听信号

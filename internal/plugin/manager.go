@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"yuelaiengine/gateway/internal/config"
+	"yuelaiengine/gateway/internal/plugin/httperr"
 	"yuelaiengine/gateway/pkg/logger"
 )
 
@@ -84,7 +85,7 @@ func (m *Manager) ExecuteChain(w http.ResponseWriter, r *http.Request, pluginSpe
 			m.log.Error(ctx, fmt.Sprintf("[插件管理器] 插件配置缺少 'name' 字段或类型不正确: %v", spec),
 				"spec", spec,
 				"action", "config_error")
-			http.Error(w, "内部服务器错误: 插件配置错误", http.StatusInternalServerError)
+			httperr.Write(w, http.StatusInternalServerError, "PLUGIN_CONFIG_INVALID", "插件配置错误")
 			return false, fmt.Errorf("无效的插件配置: %v", spec)
 		}
 
@@ -93,11 +94,11 @@ func (m *Manager) ExecuteChain(w http.ResponseWriter, r *http.Request, pluginSpe
 			m.log.Error(ctx, fmt.Sprintf("[插件管理器] 未找到名为 '%s' 的已注册插件", pluginName),
 				"plugin_name", pluginName,
 				"action", "plugin_not_found")
-			http.Error(w, "内部服务器错误: 插件未找到", http.StatusInternalServerError)
+			httperr.Write(w, http.StatusInternalServerError, "PLUGIN_NOT_FOUND", "插件未找到")
 			return false, fmt.Errorf("插件 '%s' 未注册", pluginName)
 		}
 
-		m.log.Info(ctx, fmt.Sprintf("[插件管理器] 执行插件: %s", pluginName),
+		m.log.Debug(ctx, fmt.Sprintf("[插件管理器] 执行插件: %s", pluginName),
 			"plugin_name", pluginName,
 			"action", "execute")
 
@@ -111,7 +112,7 @@ func (m *Manager) ExecuteChain(w http.ResponseWriter, r *http.Request, pluginSpe
 		}
 
 		if !continueChain {
-			m.log.Info(ctx, fmt.Sprintf("[插件管理器] 插件 '%s' 中断了请求链", pluginName),
+			m.log.Debug(ctx, fmt.Sprintf("[插件管理器] 插件 '%s' 中断了请求链", pluginName),
 				"plugin_name", pluginName,
 				"action", "chain_interrupted")
 			return false, nil
@@ -120,4 +121,3 @@ func (m *Manager) ExecuteChain(w http.ResponseWriter, r *http.Request, pluginSpe
 
 	return true, nil
 }
-

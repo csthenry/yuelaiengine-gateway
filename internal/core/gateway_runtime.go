@@ -20,8 +20,11 @@ import (
 	"yuelaiengine/gateway/internal/config"
 	"yuelaiengine/gateway/internal/core/loadbalancer"
 	handler_cb "yuelaiengine/gateway/internal/handler/circuitbreaker"
+	pl_apikey "yuelaiengine/gateway/internal/plugin/apikey"
+	pl_auth "yuelaiengine/gateway/internal/plugin/auth"
 	pl_circuitbreaker "yuelaiengine/gateway/internal/plugin/circuitbreaker"
 	pl_ratelimit "yuelaiengine/gateway/internal/plugin/ratelimit"
+	pl_rbac "yuelaiengine/gateway/internal/plugin/rbac"
 	svc_circuitbreaker "yuelaiengine/gateway/internal/service/circuitbreaker"
 	svc_ratelimit "yuelaiengine/gateway/internal/service/ratelimit"
 )
@@ -31,6 +34,17 @@ func (g *Gateway) snapshot() (*config.GatewayConfig, *Router) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.config, g.router
+}
+
+// SetConfigPath 设置配置文件路径，用于落盘与文件重载。
+func (g *Gateway) SetConfigPath(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	g.mu.Lock()
+	g.reloadPath = path
+	g.mu.Unlock()
 }
 
 // Shutdown 优雅关闭网关
@@ -44,6 +58,10 @@ func (g *Gateway) Shutdown() {
 	g.healthChecker.Shutdown()
 
 	g.mu.Lock()
+	if g.monitorCancel != nil {
+		g.monitorCancel()
+		g.monitorCancel = nil
+	}
 	defer g.mu.Unlock()
 
 	// 关闭限流服务
@@ -141,16 +159,22 @@ func (g *Gateway) ReloadFromFile(path string) error {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if err := g.applyConfigLocked(newCfg.Clone()); err != nil {
+	if err := g.applyConfigLocked(newCfg.Clone(), "reload:"+path); err != nil {
 		return err
 	}
 	g.reloadPath = path
 	return nil
 }
 
-func (g *Gateway) applyConfigLocked(newCfg *config.GatewayConfig) error {
+func (g *Gateway) applyConfigLocked(newCfg *config.GatewayConfig, source string) error {
 	if newCfg == nil {
 		return errors.New("new config is nil")
+	}
+	if source == "" {
+		source = "unknown"
+	}
+	if err := validateGatewayConfig(newCfg); err != nil {
+		return err
 	}
 	if err := validateRouteTranscodingConfigs(newCfg.Routes); err != nil {
 		return err
@@ -179,16 +203,15 @@ func (g *Gateway) applyConfigLocked(newCfg *config.GatewayConfig) error {
 		return err
 	}
 
-	// 刷新插件依赖 [TODO] Auth Plugin
-
-	// authPlugin, err := pl_auth.NewPlugin(g.lbFactory, g.healthChecker, "auth-service", newCfg.AuthService.ValidateURL, g.logger)
-	// if err != nil {
-	// 	_ = newRateLimitSvc.Close()
-	// 	return fmt.Errorf("初始化认证插件失败: %w", err)
-	// }
-	// g.pluginManager.Register(authPlugin)
-	// g.pluginManager.Register(pl_apikey.NewPlugin(g.logger))
-	// g.pluginManager.Register(pl_rbac.NewPlugin(g.logger))
+	// 刷新插件依赖
+	authPlugin, err := pl_auth.NewPlugin(g.lbFactory, g.healthChecker, "auth-service", newCfg.AuthService.ValidateURL, g.logger)
+	if err != nil {
+		_ = newRateLimitSvc.Close()
+		return fmt.Errorf("初始化认证插件失败: %w", err)
+	}
+	g.pluginManager.Register(authPlugin)
+	g.pluginManager.Register(pl_apikey.NewPlugin(g.logger))
+	g.pluginManager.Register(pl_rbac.NewPlugin(g.logger))
 
 	rateLimitPlugin := pl_ratelimit.NewPlugin(newRateLimitSvc, g.logger)
 	g.pluginManager.Register(rateLimitPlugin)
@@ -200,6 +223,8 @@ func (g *Gateway) applyConfigLocked(newCfg *config.GatewayConfig) error {
 	g.config = newCfg
 	g.router = NewRouter(newCfg.Routes, g.logger)
 	g.cbHandler = handler_cb.NewCircuitBreakerHandler(newCircuitSvc, g.logger)
+	g.recordConfigSnapshotLocked(newCfg.Clone(), source)
+	g.configureMonitorPersistenceLocked()
 
 	if oldRateLimitSvc != nil {
 		_ = oldRateLimitSvc.Close()

@@ -53,8 +53,26 @@ func NewHealthChecker(timeout time.Duration, interval time.Duration, logger logg
 // RegisterService 注册服务可进行健康检查
 func (hc *HealthChecker) RegisterService(name string, instances []string, healthPath string) {
 	statusMap := make(map[string]bool)
+	var previous map[string]bool
+	if existing, ok := hc.services.Load(name); ok {
+		if prevInfo, castOK := existing.(*ServiceCheckInfo); castOK {
+			prevInfo.statusMutex.RLock()
+			previous = make(map[string]bool, len(prevInfo.Status))
+			for url, healthy := range prevInfo.Status {
+				previous[url] = healthy
+			}
+			prevInfo.statusMutex.RUnlock()
+		}
+	}
 	for _, url := range instances {
-		statusMap[url] = false // 设置初始状态
+		// 热更新时优先复用已有健康状态，避免瞬时全部降为 unhealthy。
+		if previous != nil {
+			if healthy, ok := previous[url]; ok {
+				statusMap[url] = healthy
+				continue
+			}
+		}
+		statusMap[url] = false
 	}
 	serviceInfo := &ServiceCheckInfo{
 		Instances:  instances,
@@ -94,6 +112,8 @@ func (hc *HealthChecker) ListServices() []string {
 // Start 在 goroutine 中启动周期性健康检查
 func (hc *HealthChecker) Start() {
 	hc.logger.Info(context.Background(), "[HealthChecker] 开启健康检查...")
+	// 首轮同步探测，避免启动后长时间处于“全部实例不健康”的冷态窗口。
+	hc.runAllHealthChecks()
 	for {
 		select {
 		case <-hc.checkTicker.C:

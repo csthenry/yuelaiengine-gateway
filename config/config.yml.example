@@ -21,11 +21,19 @@ server:
 
 admin:
   # 管理端点令牌（生产建议改为环境变量 GATEWAY_ADMIN_TOKEN）
-  token: ""
+  token: "admin-secret"
 
 hot_reload:
   enabled: true
   interval: "3s"
+
+monitoring:
+  # 是否开启监控快照持久化（metrics + circuit + health）
+  persist_enabled: false
+  # 持久化文件（JSONL，每行一条快照）
+  persist_path: "./logs/monitoring/monitor-history.jsonl"
+  # 落盘间隔
+  flush_interval: "5s"
 
 health_check:
   # 网关对所有后端服务进行健康检查的全局策略。
@@ -45,7 +53,7 @@ circuit_breaker:
   # 失败阈值：连续失败多少次后触发熔断
   failure_threshold: 5
   # 成功阈值：半开状态下需要多少次成功才能恢复
-  success_threshold: 2
+  success_threshold: 3
   # 重置超时时间：熔断后等待多长时间进入半开状态
   reset_timeout: "1m"
 
@@ -171,7 +179,7 @@ routes:
   - path_prefix: "/auth"
     service_name: "auth-service"
     plugins:
-      - name: "ratelimit"            # ★ 变更点: 统一插件命名为 snake_case 风格
+      - name: "ratelimit"
         rule: "auth-service-limit"
         strategy: "ip"
       # 为认证接口应用专用的限流规则
@@ -196,43 +204,20 @@ routes:
     # 是否需要token认证
     requires_auth: false
 
-  # ------ Route 3: Requests to /service-b/* (Secured Route) ------
+  # ------ Route 3: Requests to /service-b/* (gRPC JSON Transcoding Route) ------
   - path_prefix: "/service-b"
     service_name: "service-b"
-    hash_on: "header:X-User-ID"
-    plugins:
-      - name: "ratelimit"
-        rule: "default-ip-limit"
-        strategy: "ip"
-      - name: "circuitbreaker"
-        service: "service-b"
-      - name: "auth"
-      - name: "apikey"
-        header: "X-API-Key"
-        keys:
-          - "gateway-demo-key"
-    # 需要token认证
-    requires_auth: true
-
-  # gRPC / 协议转换示例路由（面向支持 grpc+json 的上游）
-  - path_prefix: "/grpc/auth"
-    service_name: "auth-service"
     upstream_protocol: "grpc"
     protocol_convert: "http_json_to_grpc"
-    grpc_method: "/gateway.auth.AuthService/Validate"
-    # 使用 protoc 生成 descriptor set:
-    # protoc --include_imports --descriptor_set_out=./configs/proto/auth.pb ./api/auth.proto
-    proto_descriptor_path: "./configs/proto/auth.pb"
-    use_proto_names: true
+    grpc_method: "/gateway.serviceb.v1.EchoService/Echo"
+    # service-b 启动时自动写出 descriptor 到以下路径
+    proto_descriptor_path: "./config/proto/service-b-echo.pb"
+    use_proto_names: false
     emit_unpopulated: false
     discard_unknown: true
     methods:
       - "POST"
-    plugins:
-      - name: "apikey"
-        header: "X-API-Key"
-        keys:
-          - "gateway-demo-key"
+    plugins: []
 
   # 为其他需要认证的路由也设置 requires_auth: true
   - path_prefix: "/secure"
