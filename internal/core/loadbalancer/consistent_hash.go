@@ -31,15 +31,17 @@ type hashRingEntry struct {
 type ConsistentHashBalancer struct {
 	serviceName string
 	instances   []*ServiceInstance
-	ring        []hashRingEntry // 已排序哈希环，虚拟节点 -> 实例
 	mutex       sync.RWMutex
+	ring        atomic.Value // []hashRingEntry
 	counter     atomic.Uint64
 }
 
 func NewConsistentHashBalancer(serviceName string) *ConsistentHashBalancer {
-	return &ConsistentHashBalancer{
+	c := &ConsistentHashBalancer{
 		serviceName: serviceName,
 	}
+	c.ring.Store(make([]hashRingEntry, 0))
+	return c
 }
 
 func (c *ConsistentHashBalancer) RegisterInstance(serviceName string, instance *ServiceInstance) {
@@ -47,7 +49,6 @@ func (c *ConsistentHashBalancer) RegisterInstance(serviceName string, instance *
 	defer c.mutex.Unlock()
 
 	c.instances = append(c.instances, instance)
-	// 重建哈希环，保证查询时环结构一致
 	c.rebuildRingLocked()
 }
 
@@ -57,28 +58,16 @@ func (c *ConsistentHashBalancer) GetNextInstance(serviceName string) (*ServiceIn
 }
 
 func (c *ConsistentHashBalancer) GetInstanceByKey(serviceName, key string) (*ServiceInstance, error) {
-	c.mutex.RLock()
-	instance, ok := c.pickFromRingLocked(key)
-	if ok && instance != nil && instance.Alive {
-		c.mutex.RUnlock()
-		return instance, nil
-	}
-	c.mutex.RUnlock()
-
-	// 当 ring 为空或命中了不健康实例时，升级写锁并重建 ring
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	c.rebuildRingLocked()
-	instance, ok = c.pickFromRingLocked(key)
-	if !ok || instance == nil || !instance.Alive {
+	ring := c.ring.Load().([]hashRingEntry)
+	instance, ok := pickFromRing(ring, key)
+	if !ok || instance == nil {
 		return nil, errors.New("no healthy instances available")
 	}
 	return instance, nil
 }
 
-func (c *ConsistentHashBalancer) pickFromRingLocked(key string) (*ServiceInstance, bool) {
-	if len(c.ring) == 0 {
+func pickFromRing(ring []hashRingEntry, key string) (*ServiceInstance, bool) {
+	if len(ring) == 0 {
 		return nil, false
 	}
 
@@ -86,13 +75,13 @@ func (c *ConsistentHashBalancer) pickFromRingLocked(key string) (*ServiceInstanc
 	target := hashString(key)
 	// sort.Search 是标准库中提供的一个的 Binary Search 函数
 	// 在已排序的哈希环上，以 O(log N) 的效率找到第一个顺时针方向最近的节点
-	idx := sort.Search(len(c.ring), func(i int) bool {
-		return c.ring[i].hash >= target
+	idx := sort.Search(len(ring), func(i int) bool {
+		return ring[i].hash >= target
 	})
-	if idx >= len(c.ring) {
+	if idx >= len(ring) {
 		idx = 0
 	}
-	return c.ring[idx].instances, true
+	return ring[idx].instances, true
 }
 
 func (c *ConsistentHashBalancer) GetAllInstances(serviceName string) []*ServiceInstance {
@@ -131,7 +120,7 @@ func (c *ConsistentHashBalancer) rebuildRingLocked() {
 		return ring[i].hash < ring[j].hash
 	})
 
-	c.ring = ring
+	c.ring.Store(ring)
 }
 
 // hashString 非加密型哈希函数，将任意长度的字符串压缩成一个 uint32

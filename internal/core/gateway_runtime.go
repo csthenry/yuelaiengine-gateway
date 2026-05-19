@@ -31,6 +31,10 @@ import (
 
 // snapshot 返回网关当前快照
 func (g *Gateway) snapshot() (*config.GatewayConfig, *Router) {
+	snap := g.runtimeSnap.Load().(gatewayRuntimeSnapshot)
+	if snap.config != nil && snap.router != nil {
+		return snap.config, snap.router
+	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.config, g.router
@@ -222,6 +226,10 @@ func (g *Gateway) applyConfigLocked(newCfg *config.GatewayConfig, source string)
 	g.proxy.UpdateCircuitBreakerService(newCircuitSvc)
 	g.config = newCfg
 	g.router = NewRouter(newCfg.Routes, g.logger)
+	g.runtimeSnap.Store(gatewayRuntimeSnapshot{
+		config: g.config,
+		router: g.router,
+	})
 	g.cbHandler = handler_cb.NewCircuitBreakerHandler(newCircuitSvc, g.logger)
 	g.recordConfigSnapshotLocked(newCfg.Clone(), source)
 	g.configureMonitorPersistenceLocked()

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"yuelaiengine/gateway/internal/config"
 	"yuelaiengine/gateway/internal/plugin/httperr"
@@ -29,9 +30,9 @@ type Interface interface {
 
 // Manager 负责管理和执行插件
 type Manager struct {
-	plugins map[string]Interface
-	mu      sync.RWMutex
-	log     logger.Logger
+	mu   sync.Mutex
+	log  logger.Logger
+	snap atomic.Value // map[string]Interface
 }
 
 func NewManager(log logger.Logger) *Manager {
@@ -44,16 +45,16 @@ func NewManager(log logger.Logger) *Manager {
 		}
 	}
 
-	return &Manager{
-		plugins: make(map[string]Interface),
-		log:     log,
+	m := &Manager{
+		log: log,
 	}
+	m.snap.Store(make(map[string]Interface))
+	return m
 }
 
 func (m *Manager) GetPlugin(name string) Interface {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.plugins[name]
+	plugins := m.snap.Load().(map[string]Interface)
+	return plugins[name]
 }
 
 // Register 注册一个插件
@@ -65,14 +66,22 @@ func (m *Manager) Register(p Interface) {
 		"plugin_name", name,
 		"action", "register")
 
-	if _, exists := m.plugins[name]; exists {
+	current := m.snap.Load().(map[string]Interface)
+	if _, exists := current[name]; exists {
 		m.log.Warn(ctx, fmt.Sprintf("[插件管理器] 警告: 插件 '%s' 已存在，将被覆盖", name),
 			"plugin_name", name,
 			"action", "overwrite")
 	}
 	m.mu.Lock()
-	m.plugins[name] = p
-	m.mu.Unlock()
+	defer m.mu.Unlock()
+
+	oldMap := m.snap.Load().(map[string]Interface)
+	nextMap := make(map[string]Interface, len(oldMap)+1)
+	for k, v := range oldMap {
+		nextMap[k] = v
+	}
+	nextMap[name] = p
+	m.snap.Store(nextMap)
 }
 
 // ExecuteChain 执行插件链

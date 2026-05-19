@@ -31,6 +31,19 @@ import (
 	"yuelaiengine/gateway/internal/core/transcoding"
 )
 
+func transcoderCacheKey(route *config.RouteConfig) string {
+	if route == nil {
+		return ""
+	}
+	return strings.Join([]string{
+		strings.TrimSpace(route.ProtoDescriptor),
+		strings.TrimSpace(route.GRPCMethod),
+		fmt.Sprintf("up=%t", route.EmitUnpopulated),
+		fmt.Sprintf("pn=%t", route.UseProtoNames),
+		fmt.Sprintf("du=%t", route.DiscardUnknown),
+	}, "|")
+}
+
 func (p *Proxy) prepareTranscoder(route *config.RouteConfig) (string, *transcoding.RouteTranscoder, error) {
 	mode := strings.ToLower(strings.TrimSpace(route.ProtocolConvert))
 	if mode == "" || mode == "none" {
@@ -43,6 +56,13 @@ func (p *Proxy) prepareTranscoder(route *config.RouteConfig) (string, *transcodi
 		return "", nil, fmt.Errorf("不支持的 protocol_convert=%q", route.ProtocolConvert)
 	}
 
+	cacheKey := transcoderCacheKey(route)
+	if v, ok := p.transcoderCache.Load(cacheKey); ok {
+		if tr, castOK := v.(*transcoding.RouteTranscoder); castOK {
+			return mode, tr, nil
+		}
+	}
+
 	transcoder, err := transcoding.NewRouteTranscoder(p.descriptorLoader, transcoding.Options{
 		DescriptorPath:  route.ProtoDescriptor,
 		GRPCMethod:      route.GRPCMethod,
@@ -53,6 +73,7 @@ func (p *Proxy) prepareTranscoder(route *config.RouteConfig) (string, *transcodi
 	if err != nil {
 		return "", nil, err
 	}
+	p.transcoderCache.Store(cacheKey, transcoder)
 	return mode, transcoder, nil
 }
 
@@ -61,7 +82,7 @@ func applyRequestTranscoding(r *http.Request, mode string, transcoder *transcodi
 		return nil
 	}
 
-	rawBody, err := io.ReadAll(r.Body)
+	rawBody, err := readAllPooled(r.Body, r.ContentLength)
 	if err != nil {
 		return fmt.Errorf("读取请求体失败: %w", err)
 	}
@@ -87,12 +108,11 @@ func applyRequestTranscoding(r *http.Request, mode string, transcoder *transcodi
 }
 
 func rewriteRequestBody(r *http.Request, body []byte) {
-	// no-op 代表什么也不做，只是将其包装为一个 io.ReadCloser
-	// bytes.Reader 满足不了 ReadCloser 接口，不能直接赋值给 resp.Body
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.Body = newPooledReadCloser(body)
 	r.ContentLength = int64(len(body))
 	r.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
+		dup := append([]byte(nil), body...)
+		return io.NopCloser(bytes.NewReader(dup)), nil
 	}
 
 	if len(body) == 0 {
@@ -189,19 +209,22 @@ func applyJSONToGRPCResponseTranscoding(resp *http.Response, transcoder *transco
 }
 
 func readAndReplaceResponseBody(resp *http.Response) ([]byte, error) {
-	data, err := io.ReadAll(resp.Body)
+	data, err := readAllPooled(resp.Body, resp.ContentLength)
 	if err != nil {
 		return nil, err
 	}
 	_ = resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(data))
+	resp.Body = newPooledReadCloser(data)
 	return data, nil
 }
 
 func rewriteResponse(resp *http.Response, statusCode int, contentType string, body []byte) {
 	resp.StatusCode = statusCode
 	resp.Status = fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode))
-	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	resp.Body = newPooledReadCloser(body)
 	resp.ContentLength = int64(len(body))
 	resp.Header.Set("Content-Type", contentType)
 	if len(body) == 0 {

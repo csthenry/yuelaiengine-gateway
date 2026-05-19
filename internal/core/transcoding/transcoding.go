@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -23,19 +24,22 @@ import (
 
 // Options 定义路由级转码参数。
 type Options struct {
-	DescriptorPath string			// .pb 或 .bin 格式的 Proto 描述文件路径
-	GRPCMethod     string			// 指定当前路由对应的 gRPC 方法全名
-	EmitUnpopulated bool			// 如果设为 true，即使 Protobuf 字段是默认值，也会在 JSON 中显示出来
-	UseProtoNames   bool			// 命名风格控制，如果设为 true，JSON 的 Key 将使用 .proto 文件中定义的原始名称
-	DiscardUnknown  bool			// 如果客户端传来的 JSON 包含一些 Protobuf 定义中没有的字段，设为 true 会直接忽略它们
+	DescriptorPath  string // .pb 或 .bin 格式的 Proto 描述文件路径
+	GRPCMethod      string // 指定当前路由对应的 gRPC 方法全名
+	EmitUnpopulated bool   // 如果设为 true，即使 Protobuf 字段是默认值，也会在 JSON 中显示出来
+	UseProtoNames   bool   // 命名风格控制，如果设为 true，JSON 的 Key 将使用 .proto 文件中定义的原始名称
+	DiscardUnknown  bool   // 如果客户端传来的 JSON 包含一些 Protobuf 定义中没有的字段，设为 true 会直接忽略它们
 }
 
 // RouteTranscoder 基于 proto 描述做 JSON<->Protobuf 的双向转码
 type RouteTranscoder struct {
-	method         *MethodDescriptors
-	marshalOpts    protojson.MarshalOptions			// 控制输出的风格
-	unmarshalOpts  protojson.UnmarshalOptions		// 控制输入的容错
-	descriptorPath string
+	method           *MethodDescriptors
+	marshalOpts      protojson.MarshalOptions   // 控制输出的风格
+	unmarshalOpts    protojson.UnmarshalOptions // 控制输入的容错
+	protoMarshalOpts proto.MarshalOptions
+	descriptorPath   string
+	reqMsgPool       sync.Pool
+	respMsgPool      sync.Pool
 }
 
 func NewRouteTranscoder(resolver *DescriptorResolver, opts Options) (*RouteTranscoder, error) {
@@ -48,7 +52,7 @@ func NewRouteTranscoder(resolver *DescriptorResolver, opts Options) (*RouteTrans
 		return nil, err
 	}
 
-	return &RouteTranscoder{
+	t := &RouteTranscoder{
 		method: method,
 		marshalOpts: protojson.MarshalOptions{
 			UseProtoNames:   opts.UseProtoNames,
@@ -57,8 +61,16 @@ func NewRouteTranscoder(resolver *DescriptorResolver, opts Options) (*RouteTrans
 		unmarshalOpts: protojson.UnmarshalOptions{
 			DiscardUnknown: opts.DiscardUnknown,
 		},
-		descriptorPath: opts.DescriptorPath,
-	}, nil
+		protoMarshalOpts: proto.MarshalOptions{},
+		descriptorPath:   opts.DescriptorPath,
+	}
+	t.reqMsgPool.New = func() interface{} {
+		return dynamicpb.NewMessage(t.method.Input)
+	}
+	t.respMsgPool.New = func() interface{} {
+		return dynamicpb.NewMessage(t.method.Output)
+	}
+	return t, nil
 }
 
 func (t *RouteTranscoder) JSONToProtobufRequest(jsonBody []byte) ([]byte, error) {
@@ -141,7 +153,8 @@ func UnwrapGRPCFrame(frame []byte) ([]byte, error) {
 }
 
 func (t *RouteTranscoder) jsonToProtoBytes(desc protoreflect.MessageDescriptor, jsonBody []byte) ([]byte, error) {
-	msg := dynamicpb.NewMessage(desc)
+	msg, releaser := t.borrowDynamicMessage(desc)
+	defer releaser()
 
 	normalized := bytes.TrimSpace(jsonBody)
 	if len(normalized) == 0 {
@@ -151,7 +164,7 @@ func (t *RouteTranscoder) jsonToProtoBytes(desc protoreflect.MessageDescriptor, 
 		return nil, fmt.Errorf("JSON->Protobuf 失败(method=%s): %w", t.method.FullMethod, err)
 	}
 
-	out, err := proto.Marshal(msg)
+	out, err := t.protoMarshalOpts.MarshalAppend(nil, msg)
 	if err != nil {
 		return nil, fmt.Errorf("Protobuf 编码失败(method=%s): %w", t.method.FullMethod, err)
 	}
@@ -159,7 +172,9 @@ func (t *RouteTranscoder) jsonToProtoBytes(desc protoreflect.MessageDescriptor, 
 }
 
 func (t *RouteTranscoder) protoBytesToJSON(desc protoreflect.MessageDescriptor, protoBody []byte) ([]byte, error) {
-	msg := dynamicpb.NewMessage(desc)
+	msg, releaser := t.borrowDynamicMessage(desc)
+	defer releaser()
+
 	if len(protoBody) > 0 {
 		if err := proto.Unmarshal(protoBody, msg); err != nil {
 			return nil, fmt.Errorf("Protobuf->JSON 失败(method=%s): %w", t.method.FullMethod, err)
@@ -171,4 +186,26 @@ func (t *RouteTranscoder) protoBytesToJSON(desc protoreflect.MessageDescriptor, 
 		return nil, fmt.Errorf("JSON 编码失败(method=%s): %w", t.method.FullMethod, err)
 	}
 	return out, nil
+}
+
+func (t *RouteTranscoder) borrowDynamicMessage(desc protoreflect.MessageDescriptor) (*dynamicpb.Message, func()) {
+	switch desc.FullName() {
+	case t.method.Input.FullName():
+		msg := t.reqMsgPool.Get().(*dynamicpb.Message)
+		msg.Reset()
+		return msg, func() {
+			msg.Reset()
+			t.reqMsgPool.Put(msg)
+		}
+	case t.method.Output.FullName():
+		msg := t.respMsgPool.Get().(*dynamicpb.Message)
+		msg.Reset()
+		return msg, func() {
+			msg.Reset()
+			t.respMsgPool.Put(msg)
+		}
+	default:
+		msg := dynamicpb.NewMessage(desc)
+		return msg, func() {}
+	}
 }

@@ -12,7 +12,6 @@ package main
 
 import (
 	"context"
-	"net/http"
 	"time"
 
 	"yuelaiengine/gateway/internal/api"
@@ -56,19 +55,9 @@ func main() {
 		logger.Info(ctx, "配置热更新已启用", "interval", interval.String())
 	}
 
-	// 创建并启动 HTTP 服务器
-	router := api.NewRouter(gw, logger)
-	srv := core.NewServer(cfg.Server.Port, router, logger)
-	logger.Info(ctx, "HTTP 服务器创建完成", "port", cfg.Server.Port)
-
-	// 在一个 Goroutine 中启动服务器，以便主 Goroutine 可以监听信号
-	go func() {
-		if err := srv.Start(); err != nil && err != http.ErrServerClosed { // 检查 err != http.ErrServerClosed
-			logger.Fatal(ctx, "服务器启动失败", "error", err)
-		}
-	}()
-
-	// WaitShutdown 会阻塞并等待关闭信号
-	srv.WaitShutdown()
+	// 使用 Hertz(Netpoll) 承接网络入口，内部继续复用现有网关处理链路。
+	hz := api.NewHertzServer(gw, logger, cfg.Server.Port)
+	logger.Info(ctx, "Hertz 服务器创建完成", "port", cfg.Server.Port)
+	hz.Spin()
 	gw.Shutdown()
 }

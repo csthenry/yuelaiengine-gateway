@@ -13,6 +13,7 @@ package loadbalancer
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 // ServiceInstance 服务实例
@@ -45,21 +46,20 @@ var _ LoadBalancer = (*LeastConnectionsBalancer)(nil)
 
 // LoadBalancerFactory 负载均衡器工厂
 type LoadBalancerFactory struct {
-	balancers map[string]LoadBalancer
-	mutex     sync.RWMutex
+	mutex sync.Mutex
+	snap  atomic.Value // map[string]LoadBalancer
 }
 
 func NewLoadBalancerFactory() *LoadBalancerFactory {
-	return &LoadBalancerFactory{
-		balancers: make(map[string]LoadBalancer),
-	}
+	f := &LoadBalancerFactory{}
+	f.snap.Store(make(map[string]LoadBalancer))
+	return f
 }
 
 // GetOrCreateLoadBalancer 获取或创建负载均衡器
 func (f *LoadBalancerFactory) GetOrCreateLoadBalancer(serviceName string, algorithm string) LoadBalancer {
-	f.mutex.RLock()
-	lb, exists := f.balancers[serviceName]
-	f.mutex.RUnlock()
+	current := f.snap.Load().(map[string]LoadBalancer)
+	lb, exists := current[serviceName]
 	if exists {
 		return lb
 	}
@@ -67,14 +67,18 @@ func (f *LoadBalancerFactory) GetOrCreateLoadBalancer(serviceName string, algori
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
-	// 二次检查，防止其他协程创建
-	if lb, exists := f.balancers[serviceName]; exists {
+	latest := f.snap.Load().(map[string]LoadBalancer)
+	if lb, exists := latest[serviceName]; exists {
 		return lb
 	}
 
-	// 创建负载均衡器
 	lb = f.newBalancer(serviceName, algorithm)
-	f.balancers[serviceName] = lb
+	next := make(map[string]LoadBalancer, len(latest)+1)
+	for k, v := range latest {
+		next[k] = v
+	}
+	next[serviceName] = lb
+	f.snap.Store(next)
 	return lb
 }
 
@@ -98,27 +102,43 @@ func (f *LoadBalancerFactory) ReplaceServiceInstances(serviceName, algorithm str
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
+	current := f.snap.Load().(map[string]LoadBalancer)
 	lb := f.newBalancer(serviceName, algorithm)
 	for _, inst := range instances {
 		lb.RegisterInstance(serviceName, inst)
 	}
-	f.balancers[serviceName] = lb
+
+	next := make(map[string]LoadBalancer, len(current)+1)
+	for k, v := range current {
+		next[k] = v
+	}
+	next[serviceName] = lb
+	f.snap.Store(next)
 }
 
 // RemoveService 删除服务对应负载均衡器
 func (f *LoadBalancerFactory) RemoveService(serviceName string) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
-	delete(f.balancers, serviceName)
+	current := f.snap.Load().(map[string]LoadBalancer)
+	if _, ok := current[serviceName]; !ok {
+		return
+	}
+	next := make(map[string]LoadBalancer, len(current)-1)
+	for k, v := range current {
+		if k == serviceName {
+			continue
+		}
+		next[k] = v
+	}
+	f.snap.Store(next)
 }
 
 // ListServices 返回当前已注册负载均衡器的服务名
 func (f *LoadBalancerFactory) ListServices() []string {
-	f.mutex.RLock()
-	defer f.mutex.RUnlock()
-
-	out := make([]string, 0, len(f.balancers))
-	for serviceName := range f.balancers {
+	current := f.snap.Load().(map[string]LoadBalancer)
+	out := make([]string, 0, len(current))
+	for serviceName := range current {
 		out = append(out, serviceName)
 	}
 	return out
@@ -126,9 +146,8 @@ func (f *LoadBalancerFactory) ListServices() []string {
 
 // GetInstanceByKey 根据 key 选择实例（仅当该服务使用的一致性哈希策略时可用）
 func (f *LoadBalancerFactory) GetInstanceByKey(serviceName, key string) (*ServiceInstance, error) {
-	f.mutex.RLock()
-	lb, ok := f.balancers[serviceName]
-	f.mutex.RUnlock()
+	current := f.snap.Load().(map[string]LoadBalancer)
+	lb, ok := current[serviceName]
 	if !ok {
 		return nil, fmt.Errorf("service %s not found", serviceName)
 	}
@@ -142,9 +161,8 @@ func (f *LoadBalancerFactory) GetInstanceByKey(serviceName, key string) (*Servic
 
 // UpdateInstanceAlive 同步实例健康状态到对应服务的负载均衡器
 func (f *LoadBalancerFactory) UpdateInstanceAlive(serviceName, instanceURL string, alive bool) error {
-	f.mutex.RLock()
-	lb, ok := f.balancers[serviceName]
-	f.mutex.RUnlock()
+	current := f.snap.Load().(map[string]LoadBalancer)
+	lb, ok := current[serviceName]
 	if !ok {
 		return fmt.Errorf("service %s not found", serviceName)
 	}
@@ -154,9 +172,8 @@ func (f *LoadBalancerFactory) UpdateInstanceAlive(serviceName, instanceURL strin
 
 // ReleaseConnection 归还实例连接计数（LC 算法使用；其余算法 no-op）
 func (f *LoadBalancerFactory) ReleaseConnection(serviceName, instanceURL string) error {
-	f.mutex.RLock()
-	lb, ok := f.balancers[serviceName]
-	f.mutex.RUnlock()
+	current := f.snap.Load().(map[string]LoadBalancer)
+	lb, ok := current[serviceName]
 	if !ok {
 		return fmt.Errorf("service %s not found", serviceName)
 	}

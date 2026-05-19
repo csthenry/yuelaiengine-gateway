@@ -62,6 +62,7 @@ type Gateway struct {
 	versionCounter atomic.Uint64
 	configHistory  []configSnapshot
 	maxHistory     int
+	runtimeSnap    atomic.Value // gatewayRuntimeSnapshot
 }
 
 type configSnapshot struct {
@@ -69,6 +70,11 @@ type configSnapshot struct {
 	Source    string
 	CreatedAt time.Time
 	Config    *config.GatewayConfig
+}
+
+type gatewayRuntimeSnapshot struct {
+	config *config.GatewayConfig
+	router *Router
 }
 
 // NewGateway 创建网关实例，初始化组件
@@ -105,6 +111,7 @@ func NewGateway(cfg *config.GatewayConfig, logger logger.Logger) (*Gateway, erro
 		webUI:         newWebAssetServer("./web/dist"),
 		maxHistory:    20,
 	}
+	gw.runtimeSnap.Store(gatewayRuntimeSnapshot{})
 
 	gw.mu.Lock()
 	if err := gw.applyConfigLocked(cfg.Clone(), "bootstrap"); err != nil {

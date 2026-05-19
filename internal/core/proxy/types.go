@@ -13,6 +13,7 @@ package proxy
 import (
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"yuelaiengine/gateway/internal/core/health"
 	"yuelaiengine/gateway/internal/core/loadbalancer"
@@ -23,13 +24,17 @@ import (
 
 // Proxy 转发请求到后台
 type Proxy struct {
-	mutex sync.RWMutex
-	lbFactory *loadbalancer.LoadBalancerFactory
-	healthChecker *health.HealthChecker
-	logger logger.Logger
-	circuitBreakerSvc circuitbreaker.Service
-	descriptorLoader  *transcoding.DescriptorResolver
-	httpTransport     *http.Transport
+	lbFactory        *loadbalancer.LoadBalancerFactory
+	healthChecker    *health.HealthChecker
+	logger           logger.Logger
+	circuitSvc       atomic.Value // circuitSvcRef
+	descriptorLoader *transcoding.DescriptorResolver
+	httpTransport    *http.Transport
+	transcoderCache  sync.Map // key(string) -> *transcoding.RouteTranscoder
+}
+
+type circuitSvcRef struct {
+	svc circuitbreaker.Service
 }
 
 type responseWriterWrapper struct {
@@ -46,21 +51,20 @@ type hashSelector interface {
 }
 
 func NewProxy(lbFactory *loadbalancer.LoadBalancerFactory, hc *health.HealthChecker, cbSvc circuitbreaker.Service, logger logger.Logger) *Proxy {
-	return &Proxy{
-		lbFactory: lbFactory,
-		healthChecker: hc,
-		circuitBreakerSvc: cbSvc,
-		descriptorLoader:  transcoding.NewDescriptorResolver(),
-		httpTransport:     newHTTPTransport(),
-		logger: logger,
+	p := &Proxy{
+		lbFactory:        lbFactory,
+		healthChecker:    hc,
+		descriptorLoader: transcoding.NewDescriptorResolver(),
+		httpTransport:    newHTTPTransport(),
+		logger:           logger,
 	}
+	p.circuitSvc.Store(circuitSvcRef{svc: cbSvc})
+	return p
 }
 
 // UpdateCircuitBreakerService 动态更新熔断器服务依赖，用于配置热更新
 func (p *Proxy) UpdateCircuitBreakerService(svr circuitbreaker.Service) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	p.circuitBreakerSvc = svr
+	p.circuitSvc.Store(circuitSvcRef{svc: svr})
 }
 
 func (w *responseWriterWrapper) WriteHeader(statusCode int) {
@@ -77,8 +81,8 @@ func (w *responseWriterWrapper) GetStatusCode() int {
 
 type proxyHTTPError struct {
 	StatusCode int
-	Message string
-	Err error
+	Message    string
+	Err        error
 }
 
 func (e *proxyHTTPError) Error() string {

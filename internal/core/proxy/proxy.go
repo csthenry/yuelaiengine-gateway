@@ -46,9 +46,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, route *config.
 	if err != nil {
 		p.logger.Error(ctx, "[Proxy] 服务无可用实例", "service", service.Name, "error", err)
 		// 无可用实例同样视作一次服务失败，用于触发熔断策略
-		p.mutex.RLock()
-		cbSvc := p.circuitBreakerSvc
-		p.mutex.RUnlock()
+		ref := p.circuitSvc.Load().(circuitSvcRef)
+		cbSvc := ref.svc
 		if cbSvc != nil {
 			cbSvc.RecordResult(ctx, service.Name, false)
 		}
@@ -172,9 +171,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, route *config.
 	statusCode := wrapper.GetStatusCode()
 	success := statusCode >= 200 && statusCode < 400
 
-	p.mutex.RLock()
-	cbSvc := p.circuitBreakerSvc
-	p.mutex.RUnlock()
+	ref := p.circuitSvc.Load().(circuitSvcRef)
+	cbSvc := ref.svc
 	if cbSvc != nil {
 		p.logger.Debug(ctx, "[Proxy] 服务请求完成", "service", service.Name, "status_code", statusCode, "success", success)
 		cbSvc.RecordResult(ctx, service.Name, success)
